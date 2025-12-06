@@ -1,152 +1,113 @@
-#  Package Modules
-import os
-from typing import Union, BinaryIO, Dict, List, Tuple, Optional
-import time
+import torch
+import io
+import base64
+import logging
 
-#  ComfyUI Modules
-import folder_paths
-from comfy.utils import ProgressBar
+# 通用工具函数
+def serialize_to_base64(data):
+    """将 PyTorch 对象序列化为 Base64 字符串"""
+    try:
+        buffer = io.BytesIO()
+        # map_location='cpu' 确保保存时不带设备信息，虽然 save 主要存数据，但保持干净较好
+        torch.save(data, buffer)
+        b64_str = base64.b64encode(buffer.getvalue()).decode("utf-8")
+        return b64_str
+    except Exception as e:
+        logging.error(f"Serialization failed: {e}")
+        return ""
 
-#  Your Modules
-from .modules.calculator import CalculatorModel
+def deserialize_from_base64(b64_str):
+    """将 Base64 字符串反序列化为 PyTorch 对象"""
+    try:
+        if not b64_str:
+            return None
+        decoded_bytes = base64.b64decode(b64_str)
+        buffer = io.BytesIO(decoded_bytes)
+        # 强制加载到 CPU，避免显存分配问题
+        data = torch.load(buffer, map_location="cpu", weights_only=False)
+        return data
+    except Exception as e:
+        logging.error(f"Deserialization failed: {e}")
+        return None
 
-
-#  Basic practice to get paths from ComfyUI
-custom_nodes_script_dir = os.path.dirname(os.path.abspath(__file__))
-custom_nodes_model_dir = os.path.join(folder_paths.models_dir, "my-custom-nodes")
-custom_nodes_output_dir = os.path.join(folder_paths.get_output_directory(), "my-custom-nodes")
-
-
-#  These are example nodes that only contains basic functionalities with some comments.
-#  If you need detailed explanation, please refer to : https://docs.comfy.org/essentials/custom_node_walkthrough
-#  First Node:
-class MyModelLoader:
-    #  Define the input parameters of the node here.
+class AnyToBase64:
     @classmethod
     def INPUT_TYPES(s):
-        my_models = ["Model A", "Model B", "Model C"]
-
         return {
-            #  If the key is "required", the value must be filled.
             "required": {
-                #  `my_models` is the list, so it will be shown as a dropdown menu in the node. ( So that user can select one of them. )
-                #  You must provide the value in the tuple format. e.g. ("value",) or (3,) or ([1, 2],) etc.
-                "model": (my_models,),
-                "device": (['cuda', 'cpu', 'auto'],),
-            },
-            #  If the key is "optional", the value is optional.
-            "optional": {
-                "compute_type": (['float32', 'float16'],),
+                "any": ("*",),
             }
         }
 
-    #  Define these constants inside the node.
-    #  `RETURN_TYPES` is important, as it limits the parameter types that can be passed to the next node, in `INPUT_TYPES()` above.
-    RETURN_TYPES = ("MY_MODEL",)
-    RETURN_NAMES = ("my_model",)
-    #  `FUNCTION` is the function name that will be called in the node.
-    FUNCTION = "load_model"
-    #  `CATEGORY` is the category name that will be used when user searches the node.
-    CATEGORY = "CustomNodesTemplate"
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("b64_string",)
+    FUNCTION = "encode"
+    CATEGORY = "Base64_IO"
+    OUTPUT_NODE = True # 标记为输出节点，确保 API 能获取到结果
 
-    #  In the function, use same parameter names as you specified in `INPUT_TYPES()`
-    def load_model(self,
-                   model: str,
-                   device: str,
-                   compute_type: Optional[str] = None,
-                   ) -> Tuple[CalculatorModel]:
-        calculator_model = CalculatorModel()
-        calculator_model.load_model(model, device, compute_type)
+    def encode(self, any):
+        b64_str = serialize_to_base64(any)
+        # 为了让 API 能够方便地获取结果，我们将其作为 UI 输出返回
+        return {"ui": {"text": [b64_str]}, "result": (b64_str,)}
 
-        #  You can use `comfy.utils.ProgressBar` to show the progress of the process.
-        #  First, initialize the total amount of the process.
-        total_steps = 5
-        comfy_pbar = ProgressBar(total_steps)
-        #  Then, update the progress.
-        for i in range(1, total_steps):
-            time.sleep(1)
-            comfy_pbar.update(i)  #  Alternatively, you can use `comfy_pbar.update_absolute(value)` to update the progress with absolute value.
-
-        #  Return the model as a tuple.
-        return (calculator_model, )
-
-
-#  Second Node
-class CalculatePlus:
+class Base64ToLatent:
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "model": ("MY_MODEL", ),
-            },
-            #  Specify the parameters with type and default value.
-            "optional": {
-                "a": ("INT", {"default": 5}),
-                "b": ("INT", {"default": 10}),
+                "b64_string": ("STRING", {"default": "", "multiline": True, "dynamicPrompts": False}),
             }
         }
 
-    RETURN_TYPES = ("INT",)
-    RETURN_NAMES = ("plus_value",)
-    FUNCTION = "plus"
-    CATEGORY = "CustomNodesTemplate"
+    RETURN_TYPES = ("LATENT",)
+    FUNCTION = "decode"
+    CATEGORY = "Base64_IO"
 
-    def plus(self,
-             model: CalculatorModel,
-             a: Optional[int],
-             b: Optional[int],
-             ) -> Tuple[int]:
-        result = model.plus(a, b)
-        return (result, )
+    def decode(self, b64_string):
+        latent = deserialize_from_base64(b64_string)
+        if latent is None:
+            # 返回一个空的 Latent 结构防止报错，或者直接抛出异常
+            # 这里生成一个极小的 1x1 Latent 作为 fallback
+            logging.warning("Base64ToLatent: Input is empty or invalid, returning empty latent.")
+            return ({"samples": torch.zeros((1, 4, 8, 8))}, )
+        return (latent,)
 
-
-
-#  Third Node
-class CalculateMinus:
+class Base64ToConditioning:
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "model": ("MY_MODEL", ),
-                "a": ("INT", ),
-            },
-            "optional": {
-                "b": ("INT", {"default": 10}),
+                "b64_string": ("STRING", {"default": "", "multiline": True, "dynamicPrompts": False}),
             }
         }
 
-    RETURN_TYPES = ("INT",)
-    RETURN_NAMES = ("minus_value",)
-    FUNCTION = "minus"
-    CATEGORY = "CustomNodesTemplate"
+    RETURN_TYPES = ("CONDITIONING",)
+    FUNCTION = "decode"
+    CATEGORY = "Base64_IO"
 
-    def minus(self,
-             model: CalculatorModel,
-             a: Optional[int],
-             b: Optional[int],
-             ) -> Tuple[int]:
-        result = model.minus(a, b)
-        return (result, )
+    def decode(self, b64_string):
+        cond = deserialize_from_base64(b64_string)
+        if cond is None:
+            logging.error("Base64ToConditioning: Failed to decode data.")
+            raise ValueError("Invalid Base64 string for Conditioning")
+        return (cond,)
 
-
-
-#  Output Node
-class ExampleOutputNode:
+class Base64ToAny:
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "value": ("INT", ),
-            },
+                "b64_string": ("STRING", {"default": "", "multiline": True, "dynamicPrompts": False}),
+            }
         }
 
-    #  If the node is output node, set this to True.
-    OUTPUT_NODE = True
-    RETURN_TYPES = ("INT",)
-    RETURN_NAMES = ("int",)
-    FUNCTION = "result"
-    CATEGORY = "CustomNodesTemplate"
+    RETURN_TYPES = ("*",)
+    FUNCTION = "decode"
+    CATEGORY = "Base64_IO"
 
-    def result(self,
-               value: int,) -> Tuple[int]:
-        return (value, )
+    def decode(self, b64_string):
+        data = deserialize_from_base64(b64_string)
+        if data is None:
+            logging.error("Base64ToAny: Failed to decode data.")
+            raise ValueError("Invalid Base64 string")
+        return (data,)
